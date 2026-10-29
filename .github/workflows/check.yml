@@ -1,4 +1,4 @@
-name: M3U8 Health Check
+name: M3U8 Health Check & Speed Test
 
 on:
   schedule:
@@ -16,9 +16,12 @@ jobs:
         with:
           python-version: "3.12"
           
-      - name: Install dependencies
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg zip
+        
+      - name: Install Python dependencies
         run: pip install requests
-          
+        
       - name: Run checker
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
