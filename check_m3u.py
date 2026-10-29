@@ -4,7 +4,6 @@ import json
 import logging
 import requests
 import subprocess
-import zipfile
 import time
 from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -17,7 +16,6 @@ FAIL_THRESHOLD  = 2
 TIMEOUT         = 15
 USER_AGENT      = "Mozilla/5.0 (compatible; M3U8-Checker/1.0)"
 SCREENSHOT_DIR  = "screenshots"
-ZIP_NAME        = "screenshots.zip"
 # ----------------------------
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -39,7 +37,7 @@ def parse_m3u(text):
             name = None
 
 def check_stream_and_speed(url, name):
-    """Checks stream, takes screenshot, and tests speed 3 times."""
+    """Checks stream, takes screenshot, and tests speed."""
     # 1. Check Status
     try:
         r = requests.get(url, timeout=TIMEOUT, headers={"User-Agent": USER_AGENT}, allow_redirects=True, stream=True)
@@ -62,26 +60,25 @@ def check_stream_and_speed(url, name):
     try:
         subprocess.run(ffmpeg_cmd, timeout=25, check=False, capture_output=True)
     except:
-        pass # Screenshot failed, but stream might still be up
+        pass 
 
-    # 3. Speed Test (3 times)
+    # 3. Speed Test (Download up to 10MB to get a better average)
     speeds = []
-    for _ in range(3):
-        try:
-            start = time.time()
-            # Download a small chunk to measure speed
-            res = requests.get(url, timeout=10, headers={"User-Agent": USER_AGENT}, stream=True)
-            bytes_downloaded = 0
-            for chunk in res.iter_content(chunk_size=1024*1024):
-                bytes_downloaded += len(chunk)
-                if bytes_downloaded > 3 * 1024 * 1024: # Stop after 3MB
-                    break
-            end = time.time()
-            if end - start > 0:
-                speeds.append((bytes_downloaded * 8) / (end - start) / 1_000_000) # Mbps
-            res.close()
-        except:
-            pass
+    try:
+        start = time.time()
+        res = requests.get(url, timeout=10, headers={"User-Agent": USER_AGENT}, stream=True)
+        bytes_downloaded = 0
+        for chunk in res.iter_content(chunk_size=1024*1024):
+            bytes_downloaded += len(chunk)
+            if bytes_downloaded > 10 * 1024 * 1024: # Stop after 10MB
+                break
+        end = time.time()
+        if end - start > 0:
+            speed = (bytes_downloaded * 8) / (end - start) / 1_000_000 # Mbps
+            speeds.append(speed)
+        res.close()
+    except:
+        pass
 
     avg_speed = round(sum(speeds) / len(speeds), 2) if speeds else 0.0
     return True, "OK", avg_speed, img_path if os.path.exists(img_path) else None
@@ -96,21 +93,18 @@ def load_state():
 def save_state(state):
     with open(STATE_FILE, "w") as f: json.dump(state, f)
 
-def send_discord(content, embeds=None, zip_path=None):
-    payload = {"content": content}
-    if embeds: payload["embeds"] = embeds
-    
-    files = {}
-    if zip_path and os.path.exists(zip_path):
-        files["file"] = (ZIP_NAME, open(zip_path, "rb"), "application/zip")
-
+def send_discord_batch(embeds, files=None):
+    """Sends a single batch of up to 10 embeds to Discord."""
+    payload = {"embeds": embeds}
     try:
-        requests.post(DISCORD_WEBHOOK, data={"payload_json": json.dumps(payload)}, files=files, timeout=30)
+        requests.post(
+            DISCORD_WEBHOOK, 
+            data={"payload_json": json.dumps(payload)}, 
+            files=files, 
+            timeout=30
+        )
     except Exception as e:
         logging.error(f"Discord error: {e}")
-    finally:
-        if zip_path and os.path.exists(zip_path) and "file" in files:
-            files["file"][1].close()
 
 def main():
     if not DISCORD_WEBHOOK:
@@ -123,7 +117,7 @@ def main():
     try:
         text = fetch_playlist(M3U_URL)
     except Exception as e:
-        send_discord(f"⚠️ **Playlist fetch failed**\n`{M3U_URL}`\nError: `{e}`")
+        send_discord_batch([{"title": "⚠️ Playlist fetch failed", "description": str(e), "color": 0xE74C3C}])
         sys.exit(1)
 
     entries = list(parse_m3u(text))
@@ -131,7 +125,6 @@ def main():
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     
     results = []
-    # Use ThreadPoolExecutor to process streams in parallel (faster)
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = {executor.submit(check_stream_and_speed, url, name): (name, url) for name, url in entries}
         for future in futures:
@@ -142,9 +135,8 @@ def main():
             except Exception as e:
                 results.append({"name": name, "url": url, "ok": False, "detail": str(e), "speed": 0.0, "img": None})
 
-    # Process State & Alerts
     newly_down, recovered, up_count = [], [], 0
-    speed_report = []
+    speed_lines = []
 
     for res in results:
         url = res["url"]
@@ -154,7 +146,7 @@ def main():
             up_count += 1
             if prev.get("alerted"): recovered.append((res["name"], url))
             state[url] = {"fails": 0, "alerted": False, "name": res["name"]}
-            speed_report.append(f"🟢 **{res['name']}** - `{res['speed']} Mbps`")
+            speed_lines.append(f"🟢 **{res['name']}** - `{res['speed']} Mbps`")
         else:
             fails = prev.get("fails", 0) + 1
             alerted = prev.get("alerted", False)
@@ -162,38 +154,68 @@ def main():
                 newly_down.append((res["name"], url, res["detail"], fails))
                 alerted = True
             state[url] = {"fails": fails, "alerted": alerted, "name": res["name"]}
-            speed_report.append(f"🔴 **{res['name']}** - DOWN")
+            speed_lines.append(f"🔴 **{res['name']}** - DOWN")
 
     save_state(state)
 
-    # Create ZIP of screenshots
-    zip_path = None
-    if os.listdir(SCREENSHOT_DIR):
-        with zipfile.ZipFile(ZIP_NAME, 'w') as zipf:
-            for root, _, files in os.walk(SCREENSHOT_DIR):
-                for file in files:
-                    zipf.write(os.path.join(root, file), file)
-        zip_path = ZIP_NAME
+    # Prepare all images for Discord
+    images = [f for f in os.listdir(SCREENSHOT_DIR) if f.endswith(".jpg")]
+    logging.info(f"Uploading {len(images)} screenshots to Discord...")
 
-    # Build Discord Embed
-    embeds = []
-    for name, url, detail, fails in newly_down:
-        embeds.append({"title": f"🔴 DOWN: {name}", "description": f"Failed **{fails}** checks.\n```{detail}```", "color": 0xE74C3C, "fields": [{"name": "URL", "value": f"`{url}`"}]})
-    for name, url in recovered:
-        embeds.append({"title": f"🟢 RECOVERED: {name}", "description": "Stream is back online.", "color": 0x2ECC71})
-
-    # Send Summary Embed (First 10 speeds to avoid Discord limits)
-    summary_text = "\n".join(speed_report[:10]) 
-    if len(speed_report) > 10:
-        summary_text += f"\n*...and {len(speed_report)-10} more streams*"
+    # We need to send images in batches of 10 (Discord limit)
+    for i in range(0, len(images), 10):
+        batch_images = images[i:i+10]
+        files = {}
+        embeds = []
         
-    embeds.insert(0, {
-        "title": f"📊 M3U8 Hourly Report — {now}",
-        "description": f"Up: `{up_count}/{len(entries)}` | Down: `{len(newly_down)}` | Recovered: `{len(recovered)}`\n\n**Average Speeds (Mbps):**\n{summary_text}",
-        "color": 0x3498DB
-    })
+        for idx, img_name in enumerate(batch_images):
+            file_key = f"image{idx}"
+            img_path = os.path.join(SCREENSHOT_DIR, img_name)
+            files[file_key] = (img_name, open(img_path, "rb"), "image/jpeg")
+            
+            # Create an embed for each image so it shows up beautifully
+            embeds.append({
+                "title": f"📺 {img_name.replace('.jpg', '')}",
+                "image": {"url": f"attachment://{img_name}"},
+                "color": 0x2ECC71
+            })
+            
+        send_discord_batch(embeds, files=files)
+        # Close file handles
+        for f in files.values():
+            f[1].close()
+        time.sleep(2) # Prevent Discord rate limits
 
-    send_discord("📦 **Screenshots attached below!**", embeds=embeds[:10], zip_path=zip_path)
+    # Now send the Text Reports (Chunked into 10 embeds per message)
+    logging.info("Sending text reports...")
+    
+    # Split the speed lines into chunks of 15 lines to fit in embeds
+    chunk_size = 15
+    speed_chunks = [speed_lines[i:i + chunk_size] for i in range(0, len(speed_lines), chunk_size)]
+    
+    report_embeds = []
+    for i, chunk in enumerate(speed_chunks):
+        report_embeds.append({
+            "title": f"📊 Stream Speeds (Part {i+1})",
+            "description": "\n".join(chunk),
+            "color": 0x3498DB
+        })
+
+    # Send the text reports in batches of 10 embeds
+    for i in range(0, len(report_embeds), 10):
+        batch = report_embeds[i:i+10]
+        # Add a header to the very first message
+        if i == 0:
+            header = {
+                "title": f"📈 M3U8 Health Report — {now}",
+                "description": f"**Total Streams:** `{len(entries)}`\n**Up:** `{up_count}`\n**Down:** `{len(newly_down)}`\n**Recovered:** `{len(recovered)}`",
+                "color": 0x9B59B6
+            }
+            batch.insert(0, header)
+        
+        send_discord_batch(batch)
+        time.sleep(1)
+
     logging.info("Done.")
 
 if __name__ == "__main__":
